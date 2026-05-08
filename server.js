@@ -29,25 +29,42 @@ const GAMES = {
     luck8_sicbo: { name: 'Luck8 Sicbo40', url: 'https://heroes-presents-pound-tablet.trycloudflare.com/api/sicbo40', type: 'taixiu', icon: '🎲' }
 };
 
+// Lưu lịch sử dự đoán
 let predictionsDB = {};
+let actualResultsDB = {};
+
 for (const key of Object.keys(GAMES)) {
     predictionsDB[key] = [];
-    try { if (fs.existsSync(`history_${key}.json`)) predictionsDB[key] = JSON.parse(fs.readFileSync(`history_${key}.json`)); } catch(e) {}
+    actualResultsDB[key] = [];
+    try {
+        if (fs.existsSync(`history_${key}.json`)) {
+            predictionsDB[key] = JSON.parse(fs.readFileSync(`history_${key}.json`, 'utf8'));
+        }
+        if (fs.existsSync(`actual_${key}.json`)) {
+            actualResultsDB[key] = JSON.parse(fs.readFileSync(`actual_${key}.json`, 'utf8'));
+        }
+    } catch(e) {}
 }
-function saveHistory(k) { try { fs.writeFileSync(`history_${k}.json`, JSON.stringify(predictionsDB[k], null, 2)); } catch(e) {} }
+
+function saveHistory(gameKey) {
+    try { fs.writeFileSync(`history_${gameKey}.json`, JSON.stringify(predictionsDB[gameKey], null, 2)); } catch(e) {}
+}
+function saveActual(gameKey) {
+    try { fs.writeFileSync(`actual_${gameKey}.json`, JSON.stringify(actualResultsDB[gameKey], null, 2)); } catch(e) {}
+}
 
 // ==================== FETCH DATA ====================
 async function fetchGameData(gameKey) {
     const game = GAMES[gameKey];
     try {
         const res = await axios.get(game.url, { timeout: 10000 });
+        
         if (game.type === 'taixiu' && res.data && res.data.ket_qua) {
-            let ketQua = res.data.ket_qua === 'Tài' || res.data.ket_qua === 'TAI' ? 'T' : 'X';
-            return [{ phien: res.data.phien, ket_qua: ketQua, tong: res.data.tong || 0 }];
+            let ketQua = res.data.ket_qua === 'Tài' || res.data.ket_qua === 'TAI' ? 'Tài' : 'Xỉu';
+            return { phien: res.data.phien, ket_qua: ketQua, tong: res.data.tong || 0 };
         }
-        if (game.type === 'xocdia' && res.data) {
-            let ketQua = res.data.ket_qua === 'Tài' ? 'T' : 'X';
-            return [{ phien: Date.now(), ket_qua: ketQua, tong: 0 }];
+        if (game.type === 'xocdia' && res.data && res.data.ket_qua) {
+            return { phien: Date.now(), ket_qua: res.data.ket_qua === 'Tài' ? 'Chẵn' : 'Lẻ', tong: 0 };
         }
         if (game.type === 'bcr' && res.data?.data) {
             let allResults = [];
@@ -58,209 +75,254 @@ async function fetchGameData(gameKey) {
                     }
                 }
             }
-            return allResults;
+            return { data: allResults, phien: Date.now() };
         }
         return null;
     } catch(e) { return null; }
 }
 
-// ==================== THUẬT TOÁN RIÊNG CHO TÀI XỈU ====================
-function thuatToanTaiXiu(history) {
-    if (!history || history.length < 3) return { du_doan: 'Tài', do_tin_cay: 50, ly_do: 'Chưa đủ dữ liệu' };
-    const res = history.map(h => h.ket_qua);
-    const len = res.length;
+// ==================== THUẬT TOÁN TÀI XỈU ====================
+function thuatToanTaiXiu(history, currentPhien, currentResult) {
+    let duDoan = 'Tài';
+    let doTinCay = 65;
+    let lyDo = 'Mặc định (chưa đủ dữ liệu)';
     
-    // Cầu bệt
-    let bet = 1;
-    for (let i = 1; i < Math.min(len, 15); i++) if (res[i] === res[0]) bet++; else break;
-    if (bet >= 3) {
-        let pred = res[0] === 'T' ? 'Tài' : 'Xỉu';
-        let conf = Math.min(88, 50 + bet * 4);
-        return { du_doan: pred, do_tin_cay: conf, ly_do: `🔴 Cầu bệt ${bet} phiên - ${pred}` };
-    }
-    
-    // Cầu đảo 1-1
-    let dao = 1;
-    for (let i = 1; i < Math.min(len, 12); i++) if (res[i] !== res[i-1]) dao++; else break;
-    if (dao >= 4) {
-        let pred = res[dao-1] === 'T' ? 'Xỉu' : 'Tài';
-        let conf = Math.min(85, 55 + dao * 2.5);
-        return { du_doan: pred, do_tin_cay: conf, ly_do: `🟡 Cầu đảo 1-1 dài ${dao} nhịp → ${pred}` };
-    }
-    
-    // Cầu 2-2
-    if (len >= 4 && res[0] === res[1] && res[2] === res[3] && res[0] !== res[2]) {
-        let pred = res[2] === 'T' ? 'Xỉu' : 'Tài';
-        return { du_doan: pred, do_tin_cay: 82, ly_do: `🟢 Cầu 2-2 → ${pred}` };
-    }
-    
-    // Cầu 1-2-1
-    if (len >= 4 && res[0] !== res[1] && res[1] === res[2] && res[2] !== res[3] && res[0] === res[3]) {
-        let pred = res[0] === 'T' ? 'Tài' : 'Xỉu';
-        return { du_doan: pred, do_tin_cay: 86, ly_do: `🎯 Cầu 1-2-1 → ${pred}` };
-    }
-    
-    // Xu hướng 3 phiên
-    let t3 = res.slice(0,3).filter(r=>r==='T').length;
-    let pred = t3 >= 2 ? 'Tài' : 'Xỉu';
-    return { du_doan: pred, do_tin_cay: 65, ly_do: `📊 Xu hướng ${t3}T-${3-t3}X` };
-}
-
-// ==================== THUẬT TOÁN RIÊNG CHO BCR (Con/Cái/Hòa/Con Đôi/Cái Đôi) ====================
-function thuatToanBCR(results) {
-    if (!results || results.length < 5) {
-        return { du_doan: 'Chưa đủ dữ liệu', do_tin_cay: 50, phan_tich: 'Cần ít nhất 5 ván để phân tích' };
-    }
-    
-    let resultsStr = results.map(r => r.result).join('');
-    let lastChar = resultsStr[resultsStr.length - 1] || '?';
-    
-    // Phân tích cầu Con/Cái (B=Con/Cái? B là Banker/Con, P là Player/Cái)
-    let betStreak = 1;
-    for (let i = resultsStr.length - 2; i >= 0; i--) {
-        if (resultsStr[i] === lastChar) betStreak++;
-        else break;
-    }
-    
-    let dao = 1;
-    for (let i = resultsStr.length - 2; i >= 0; i--) {
-        if (resultsStr[i] !== resultsStr[i+1]) dao++;
-        else break;
-    }
-    
-    // Dự đoán Con/Cái
-    let duDoanConCai = '';
-    let doTinCayConCai = 50;
-    let lyDoConCai = '';
-    
-    if (betStreak >= 3) {
-        duDoanConCai = lastChar === 'B' ? '🏦 CON' : (lastChar === 'P' ? '👤 CÁI' : (lastChar === 'T' ? '🏦 CON' : '👤 CÁI'));
-        doTinCayConCai = Math.min(85, 55 + betStreak * 5);
-        lyDoConCai = `📈 Cầu bệt ${betStreak} ván ${lastChar === 'B' ? 'CON' : 'CÁI'} → theo`;
-    } else if (dao >= 4) {
-        let next = lastChar === 'B' ? 'CÁI' : 'CON';
-        duDoanConCai = next === 'CON' ? '🏦 CON' : '👤 CÁI';
-        doTinCayConCai = Math.min(82, 58 + dao * 2);
-        lyDoConCai = `🔄 Cầu đảo ${dao} ván → bẻ sang ${next}`;
-    } else {
-        // Đếm tần suất 10 ván gần nhất
-        let last10 = resultsStr.slice(-10);
-        let b = (last10.match(/B/g) || []).length;
-        let p = (last10.match(/P/g) || []).length;
-        if (b > p + 2) {
-            duDoanConCai = '👤 CÁI';
-            doTinCayConCai = 72;
-            lyDoConCai = `📊 CON đang nóng ${b}/10 → bẻ CÁI`;
-        } else if (p > b + 2) {
-            duDoanConCai = '🏦 CON';
-            doTinCayConCai = 72;
-            lyDoConCai = `📊 CÁI đang nóng ${p}/10 → bẻ CON`;
-        } else {
-            duDoanConCai = lastChar === 'B' ? '🏦 CON' : '👤 CÁI';
-            doTinCayConCai = 60;
-            lyDoConCai = `📊 Theo xu hướng ván cuối (${lastChar === 'B' ? 'CON' : 'CÁI'})`;
+    if (history && history.length >= 3) {
+        const res = history.map(h => h.ket_qua);
+        const len = res.length;
+        
+        // Bệt
+        let bet = 1;
+        for (let i = 1; i < Math.min(len, 15); i++) if (res[i] === res[0]) bet++; else break;
+        if (bet >= 3) {
+            duDoan = res[0] === 'Tài' ? 'Tài' : 'Xỉu';
+            doTinCay = Math.min(88, 50 + bet * 4);
+            lyDo = `🔴 Bệt ${bet} phiên → ${duDoan}`;
+        }
+        // Đảo 1-1
+        else {
+            let dao = 1;
+            for (let i = 1; i < Math.min(len, 12); i++) if (res[i] !== res[i-1]) dao++; else break;
+            if (dao >= 4) {
+                duDoan = res[dao-1] === 'Tài' ? 'Xỉu' : 'Tài';
+                doTinCay = Math.min(85, 55 + dao * 2.5);
+                lyDo = `🟡 Đảo ${dao} nhịp → ${duDoan}`;
+            }
+            // 2-2
+            else if (len >= 4 && res[0] === res[1] && res[2] === res[3] && res[0] !== res[2]) {
+                duDoan = res[2] === 'Tài' ? 'Xỉu' : 'Tài';
+                doTinCay = 82;
+                lyDo = `🟢 Cầu 2-2 → ${duDoan}`;
+            }
+            // Xu hướng 3 phiên cuối
+            else {
+                let t3 = res.slice(0,3).filter(r => r === 'Tài').length;
+                duDoan = t3 >= 2 ? 'Tài' : 'Xỉu';
+                doTinCay = 65;
+                lyDo = `📊 Xu hướng ${t3}T-${3-t3}X → ${duDoan}`;
+            }
         }
     }
     
-    // Dự đoán Hòa (T)
-    let tCount = (resultsStr.match(/T/g) || []).length;
-    let last5 = resultsStr.slice(-5);
-    let t5 = (last5.match(/T/g) || []).length;
-    let duDoanHoa = '';
-    let doTinCayHoa = 0;
-    let lyDoHoa = '';
-    
-    if (tCount >= 3 && t5 >= 1) {
-        duDoanHoa = '⚖️ HÒA';
-        doTinCayHoa = 65;
-        lyDoHoa = `🎲 Hòa xuất hiện ${tCount} lần, có thể về tiếp`;
-    } else if (t5 === 0 && resultsStr.length > 20) {
-        duDoanHoa = '⚖️ HÒA';
-        doTinCayHoa = 55;
-        lyDoHoa = `❄️ Hòa vắng ${resultsStr.length - tCount} ván, khả năng về`;
-    } else {
-        duDoanHoa = '❌ KHÔNG HÒA';
-        doTinCayHoa = 85;
-        lyDoHoa = `📊 Hòa hiếm khi xuất hiện (${tCount}/${resultsStr.length})`;
-    }
-    
-    // Dự đoán Con Đôi (BB) và Cái Đôi (PP)
-    let duDoanConDoi = '';
-    let doTinCayConDoi = 0;
-    let lyDoConDoi = '';
-    let duDoanCaiDoi = '';
-    let doTinCayCaiDoi = 0;
-    let lyDoCaiDoi = '';
-    
-    let last3Pairs = [];
-    for (let i = 0; i < resultsStr.length - 1; i++) {
-        if (resultsStr[i] === resultsStr[i+1]) last3Pairs.push(resultsStr[i] + resultsStr[i+1]);
-    }
-    let lastPair = last3Pairs.length > 0 ? last3Pairs[last3Pairs.length-1] : '';
-    
-    if (lastPair === 'BB') {
-        duDoanConDoi = '🎲 CON ĐÔI (BB)';
-        doTinCayConDoi = 70;
-        lyDoConDoi = `🔄 Ván trước có BB (Con Đôi), khả năng lặp lại`;
-    } else if (last3Pairs.filter(p => p === 'BB').length >= 2) {
-        duDoanConDoi = '🎲 CON ĐÔI (BB)';
-        doTinCayConDoi = 65;
-        lyDoConDoi = `📊 Đã có ${last3Pairs.filter(p=>p==='BB').length} lần BB gần đây`;
-    } else {
-        duDoanConDoi = '❌ KHÔNG CON ĐÔI';
-        doTinCayConDoi = 85;
-        lyDoConDoi = `📊 BB hiếm gặp`;
-    }
-    
-    if (lastPair === 'PP') {
-        duDoanCaiDoi = '🎲 CÁI ĐÔI (PP)';
-        doTinCayCaiDoi = 70;
-        lyDoCaiDoi = `🔄 Ván trước có PP (Cái Đôi), khả năng lặp lại`;
-    } else if (last3Pairs.filter(p => p === 'PP').length >= 2) {
-        duDoanCaiDoi = '🎲 CÁI ĐÔI (PP)';
-        doTinCayCaiDoi = 65;
-        lyDoCaiDoi = `📊 Đã có ${last3Pairs.filter(p=>p==='PP').length} lần PP gần đây`;
-    } else {
-        duDoanCaiDoi = '❌ KHÔNG CÁI ĐÔI';
-        doTinCayCaiDoi = 85;
-        lyDoCaiDoi = `📊 PP hiếm gặp`;
+    // Kiểm tra đúng/sai của dự đoán trước
+    let lastPrediction = predictionsDB[gameKey]?.[0];
+    let ketQuaTruoc = currentResult || null;
+    let dungSai = null;
+    if (lastPrediction && ketQuaTruoc) {
+        dungSai = lastPrediction.du_doan === ketQuaTruoc ? '✅ ĐÚNG' : '❌ SAI';
     }
     
     return {
-        success: true,
-        du_doan_con_cai: duDoanConCai,
-        tin_cay_con_cai: doTinCayConCai + '%',
-        ly_do_con_cai: lyDoConCai,
-        du_doan_hoa: duDoanHoa,
-        tin_cay_hoa: doTinCayHoa + '%',
-        ly_do_hoa: lyDoHoa,
-        du_doan_con_doi: duDoanConDoi,
-        tin_cay_con_doi: doTinCayConDoi + '%',
-        ly_do_con_doi: lyDoConDoi,
-        du_doan_cai_doi: duDoanCaiDoi,
-        tin_cay_cai_doi: doTinCayCaiDoi + '%',
-        ly_do_cai_doi: lyDoCaiDoi,
-        phan_tich_cau: {
-            chuoi_bet: betStreak,
-            chuoi_dao: dao,
-            tan_suat_B: (resultsStr.match(/B/g) || []).length,
-            tan_suat_P: (resultsStr.match(/P/g) || []).length,
-            tan_suat_T: (resultsStr.match(/T/g) || []).length,
-            ket_qua_gan_nhat: lastChar === 'B' ? 'CON' : (lastChar === 'P' ? 'CÁI' : (lastChar === 'T' ? 'HÒA' : '?')),
-            lich_su_10_gan_nhat: resultsStr.slice(-10)
-        }
+        phien_hien_tai: currentPhien,
+        ket_qua_truoc: ketQuaTruoc,
+        dung_sai_truoc: dungSai,
+        du_doan: duDoan,
+        do_tin_cay: doTinCay + '%',
+        ly_do: lyDo
     };
 }
 
-// ==================== THUẬT TOÁN RIÊNG CHO XÓC ĐĨA ====================
-function thuatToanXocDia(history) {
-    if (!history || history.length < 3) return { du_doan: 'Chẵn', do_tin_cay: 50, ly_do: 'Chưa đủ dữ liệu' };
-    const res = history.map(h => h.ket_qua);
-    let chan = res.filter(r => r === 'T').length;
-    let le = res.length - chan;
-    if (chan > le + 2) return { du_doan: 'Lẻ', do_tin_cay: 75, ly_do: `📊 Chẵn đang nóng ${chan}/${res.length} → bẻ Lẻ` };
-    if (le > chan + 2) return { du_doan: 'Chẵn', do_tin_cay: 75, ly_do: `📊 Lẻ đang nóng ${le}/${res.length} → bẻ Chẵn` };
-    return { du_doan: res[0] === 'T' ? 'Chẵn' : 'Lẻ', do_tin_cay: 60, ly_do: `📈 Theo xu hướng ván cuối (${res[0] === 'T' ? 'Chẵn' : 'Lẻ'})` };
+// ==================== THUẬT TOÁN BCR (CON/CÁI/HÒA/CON ĐÔI/CÁI ĐÔI) ====================
+function thuatToanBCR(data, currentPhien) {
+    let results = data.data || [];
+    let resultsStr = results.map(r => r.result).join('');
+    let lastResult = resultsStr.length > 0 ? resultsStr[resultsStr.length - 1] : '?';
+    
+    // Lấy kết quả trước
+    let lastPrediction = predictionsDB.bcr_sexy?.[0];
+    let ketQuaTruoc = null;
+    let dungSai = null;
+    
+    if (lastResult !== '?') {
+        ketQuaTruoc = lastResult === 'B' ? 'Con' : (lastResult === 'P' ? 'Cái' : (lastResult === 'T' ? 'Hòa' : '?'));
+        if (lastPrediction) {
+            let predStr = lastPrediction.du_doan_con_cai?.includes('CON') ? 'Con' : (lastPrediction.du_doan_con_cai?.includes('CÁI') ? 'Cái' : null);
+            if (predStr && ketQuaTruoc !== '?') {
+                dungSai = predStr === ketQuaTruoc ? '✅ ĐÚNG' : '❌ SAI';
+            }
+        }
+    }
+    
+    // Dự đoán Con/Cái
+    let bCount = (resultsStr.match(/B/g) || []).length;
+    let pCount = (resultsStr.match(/P/g) || []).length;
+    let tCount = (resultsStr.match(/T/g) || []).length;
+    
+    let duDoanConCai = 'Con';
+    let doTinCayConCai = 60;
+    let lyDoConCai = 'Mặc định';
+    
+    if (resultsStr.length >= 3) {
+        let bet = 1;
+        for (let i = resultsStr.length - 2; i >= 0; i--) {
+            if (resultsStr[i] === lastResult) bet++;
+            else break;
+        }
+        if (bet >= 3) {
+            duDoanConCai = lastResult === 'B' ? 'Con' : 'Cái';
+            doTinCayConCai = Math.min(85, 55 + bet * 4);
+            lyDoConCai = `📈 Bệt ${bet} ván ${duDoanConCai}`;
+        } else {
+            let dao = 1;
+            for (let i = resultsStr.length - 2; i >= 0; i--) {
+                if (resultsStr[i] !== resultsStr[i+1]) dao++;
+                else break;
+            }
+            if (dao >= 4) {
+                duDoanConCai = lastResult === 'B' ? 'Cái' : 'Con';
+                doTinCayConCai = Math.min(82, 58 + dao * 2);
+                lyDoConCai = `🔄 Đảo ${dao} ván → ${duDoanConCai}`;
+            } else {
+                let last10 = resultsStr.slice(-10);
+                let b10 = (last10.match(/B/g) || []).length;
+                let p10 = (last10.match(/P/g) || []).length;
+                if (b10 > p10 + 2) {
+                    duDoanConCai = 'Cái';
+                    doTinCayConCai = 72;
+                    lyDoConCai = `📊 Con nóng ${b10}/10 → bẻ Cái`;
+                } else if (p10 > b10 + 2) {
+                    duDoanConCai = 'Con';
+                    doTinCayConCai = 72;
+                    lyDoConCai = `📊 Cái nóng ${p10}/10 → bẻ Con`;
+                } else {
+                    duDoanConCai = lastResult === 'B' ? 'Con' : 'Cái';
+                    doTinCayConCai = 60;
+                    lyDoConCai = `📈 Theo xu hướng (${duDoanConCai})`;
+                }
+            }
+        }
+    }
+    
+    // Dự đoán Hòa
+    let duDoanHoa = 'Không Hòa';
+    let doTinCayHoa = 85;
+    let lyDoHoa = 'Hòa hiếm khi xuất hiện';
+    
+    let t5 = resultsStr.slice(-5);
+    let tCount5 = (t5.match(/T/g) || []).length;
+    if (tCount >= 2 && tCount5 >= 1) {
+        duDoanHoa = 'Hòa';
+        doTinCayHoa = 65;
+        lyDoHoa = `🎲 Hòa xuất hiện ${tCount} lần, có thể về`;
+    } else if (tCount5 === 0 && resultsStr.length > 20) {
+        duDoanHoa = 'Hòa';
+        doTinCayHoa = 58;
+        lyDoHoa = `❄️ Hòa vắng ${resultsStr.length - tCount} ván`;
+    }
+    
+    // Dự đoán Con Đôi (BB)
+    let duDoanConDoi = 'Không Con Đôi';
+    let doTinCayConDoi = 85;
+    let lyDoConDoi = 'Con đôi hiếm';
+    
+    let hasBB = resultsStr.includes('BB');
+    let lastTwo = resultsStr.slice(-2);
+    if (hasBB && lastTwo === 'BB') {
+        duDoanConDoi = 'Con Đôi (BB)';
+        doTinCayConDoi = 70;
+        lyDoConDoi = `🔄 Ván trước có BB → khả năng về tiếp`;
+    } else if ((resultsStr.match(/BB/g) || []).length >= 2) {
+        duDoanConDoi = 'Con Đôi (BB)';
+        doTinCayConDoi = 62;
+        lyDoConDoi = `📊 Đã có ${(resultsStr.match(/BB/g) || []).length} lần BB gần đây`;
+    }
+    
+    // Dự đoán Cái Đôi (PP)
+    let duDoanCaiDoi = 'Không Cái Đôi';
+    let doTinCayCaiDoi = 85;
+    let lyDoCaiDoi = 'Cái đôi hiếm';
+    
+    let hasPP = resultsStr.includes('PP');
+    if (hasPP && lastTwo === 'PP') {
+        duDoanCaiDoi = 'Cái Đôi (PP)';
+        doTinCayCaiDoi = 70;
+        lyDoCaiDoi = `🔄 Ván trước có PP → khả năng về tiếp`;
+    } else if ((resultsStr.match(/PP/g) || []).length >= 2) {
+        duDoanCaiDoi = 'Cái Đôi (PP)';
+        doTinCayCaiDoi = 62;
+        lyDoCaiDoi = `📊 Đã có ${(resultsStr.match(/PP/g) || []).length} lần PP gần đây`;
+    }
+    
+    return {
+        phien_hien_tai: currentPhien,
+        ket_qua_truoc: ketQuaTruoc,
+        dung_sai_truoc: dungSai,
+        du_doan_con_cai: duDoanConCai,
+        do_tin_cay_con_cai: doTinCayConCai + '%',
+        ly_do_con_cai: lyDoConCai,
+        du_doan_hoa: duDoanHoa,
+        do_tin_cay_hoa: doTinCayHoa + '%',
+        ly_do_hoa: lyDoHoa,
+        du_doan_con_doi: duDoanConDoi,
+        do_tin_cay_con_doi: doTinCayConDoi + '%',
+        ly_do_con_doi: lyDoConDoi,
+        du_doan_cai_doi: duDoanCaiDoi,
+        do_tin_cay_cai_doi: doTinCayCaiDoi + '%',
+        ly_do_cai_doi: lyDoCaiDoi
+    };
+}
+
+// ==================== THUẬT TOÁN XÓC ĐĨA ====================
+function thuatToanXocDia(history, currentPhien, currentResult) {
+    let duDoan = 'Chẵn';
+    let doTinCay = 60;
+    let lyDo = 'Mặc định';
+    
+    if (history && history.length >= 3) {
+        const res = history.map(h => h.ket_qua);
+        let chan = res.filter(r => r === 'Chẵn').length;
+        let le = res.length - chan;
+        
+        if (chan > le + 1) {
+            duDoan = 'Lẻ';
+            doTinCay = 72;
+            lyDo = `📊 Chẵn nóng ${chan}/${res.length} → bẻ Lẻ`;
+        } else if (le > chan + 1) {
+            duDoan = 'Chẵn';
+            doTinCay = 72;
+            lyDo = `📊 Lẻ nóng ${le}/${res.length} → bẻ Chẵn`;
+        } else {
+            duDoan = res[0] === 'Chẵn' ? 'Chẵn' : 'Lẻ';
+            doTinCay = 60;
+            lyDo = `📈 Theo xu hướng ván cuối (${duDoan})`;
+        }
+    }
+    
+    let lastPrediction = predictionsDB[gameKey]?.[0];
+    let ketQuaTruoc = currentResult || null;
+    let dungSai = null;
+    if (lastPrediction && ketQuaTruoc) {
+        dungSai = lastPrediction.du_doan === ketQuaTruoc ? '✅ ĐÚNG' : '❌ SAI';
+    }
+    
+    return {
+        phien_hien_tai: currentPhien,
+        ket_qua_truoc: ketQuaTruoc,
+        dung_sai_truoc: dungSai,
+        du_doan: duDoan,
+        do_tin_cay: doTinCay + '%',
+        ly_do: lyDo
+    };
 }
 
 // ==================== DỰ ĐOÁN CHUNG ====================
@@ -272,38 +334,61 @@ async function layDuDoan(gameKey) {
     if (!data) return { success: false, error: 'Không lấy được dữ liệu', game: game.name };
     
     let result = {};
+    let history = [];
+    
+    // Lấy lịch sử dự đoán trước đó
+    let previousPredictions = predictionsDB[gameKey] || [];
+    
     if (game.type === 'bcr') {
-        result = thuatToanBCR(data);
+        let currentPhien = data.phien;
+        result = thuatToanBCR(data, currentPhien);
         result.game = game.name;
         result.icon = game.icon;
         result.timestamp = new Date().toISOString();
-    } else if (game.type === 'taixiu') {
-        let txResult = thuatToanTaiXiu(data);
-        result = {
-            success: true,
-            game: game.name,
-            icon: game.icon,
-            du_doan: txResult.du_doan,
-            do_tin_cay: txResult.do_tin_cay + '%',
-            ly_do: txResult.ly_do
-        };
-    } else if (game.type === 'xocdia') {
-        let xdResult = thuatToanXocDia(data);
-        result = {
-            success: true,
-            game: game.name,
-            icon: game.icon,
-            du_doan: xdResult.du_doan,
-            do_tin_cay: xdResult.do_tin_cay + '%',
-            ly_do: xdResult.ly_do
-        };
-    } else {
+        
+        // Lưu lịch sử kết quả thực tế
+        let lastResult = data.data?.length > 0 ? data.data[data.data.length-1].result : null;
+        if (lastResult) {
+            let actual = lastResult === 'B' ? 'Con' : (lastResult === 'P' ? 'Cái' : (lastResult === 'T' ? 'Hòa' : null));
+            if (actual) {
+                actualResultsDB[gameKey].push({ phien: currentPhien, ket_qua: actual, timestamp: new Date().toISOString() });
+                saveActual(gameKey);
+            }
+        }
+    } 
+    else if (game.type === 'taixiu') {
+        let currentPhien = data.phien;
+        let currentResult = data.ket_qua;
+        
+        // Lấy lịch sử kết quả từ file actual
+        let actualList = actualResultsDB[gameKey] || [];
+        
+        result = thuatToanTaiXiu(previousPredictions.map(p => ({ ket_qua: p.ket_qua })), currentPhien, currentResult);
+        result.game = game.name;
+        result.icon = game.icon;
+        result.timestamp = new Date().toISOString();
+        
+        // Lưu kết quả thực tế
+        actualResultsDB[gameKey].push({ phien: currentPhien, ket_qua: currentResult, timestamp: new Date().toISOString() });
+        saveActual(gameKey);
+    }
+    else if (game.type === 'xocdia') {
+        let currentPhien = data.phien;
+        let currentResult = data.ket_qua;
+        result = thuatToanXocDia(previousPredictions.map(p => ({ ket_qua: p.ket_qua })), currentPhien, currentResult);
+        result.game = game.name;
+        result.icon = game.icon;
+        result.timestamp = new Date().toISOString();
+        
+        actualResultsDB[gameKey].push({ phien: currentPhien, ket_qua: currentResult, timestamp: new Date().toISOString() });
+        saveActual(gameKey);
+    }
+    else {
         result = { success: false, error: 'Loại game không hỗ trợ', game: game.name };
     }
     
-    // Lưu lịch sử
-    const record = { ...result, timestamp: new Date().toISOString() };
-    predictionsDB[gameKey].unshift(record);
+    // Lưu dự đoán vào lịch sử
+    predictionsDB[gameKey].unshift(result);
     if (predictionsDB[gameKey].length > 50) predictionsDB[gameKey] = predictionsDB[gameKey].slice(0, 50);
     saveHistory(gameKey);
     
@@ -318,13 +403,22 @@ app.get('/api/predict/:game', async (req, res) => {
 
 app.get('/api/history/:game', (req, res) => {
     const k = req.params.game;
-    res.json({ success: true, game: GAMES[k]?.name, history: predictionsDB[k] || [], total: predictionsDB[k]?.length || 0 });
+    res.json({ 
+        success: true, 
+        game: GAMES[k]?.name, 
+        predictions: predictionsDB[k] || [], 
+        actual_results: actualResultsDB[k] || [],
+        total_predictions: predictionsDB[k]?.length || 0,
+        total_actual: actualResultsDB[k]?.length || 0
+    });
 });
 
 app.post('/api/reset/:game', (req, res) => {
     const k = req.params.game;
     predictionsDB[k] = [];
+    actualResultsDB[k] = [];
     saveHistory(k);
+    saveActual(k);
     res.json({ success: true, message: 'Đã reset lịch sử' });
 });
 
@@ -345,14 +439,47 @@ app.get('/', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>🎲 ALL GAME - ${Object.keys(GAMES).length} GAME</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui;background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;padding:20px;color:#fff}.container{max-width:1400px;margin:0 auto}h1{text-align:center;margin-bottom:10px;background:linear-gradient(135deg,#f093fb,#f5576c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}.timer{text-align:center;margin-bottom:20px;font-size:.8rem}.games-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:20px}.game-card{background:rgba(255,255,255,0.08);border-radius:20px;padding:18px;backdrop-filter:blur(10px)}.game-header{font-size:1.1rem;font-weight:bold;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.2);padding-bottom:8px}.pred-box{background:linear-gradient(135deg,#667eea,#764ba2);border-radius:15px;padding:15px;text-align:center;margin:12px 0}.pred-value{font-size:1.8rem;font-weight:800;margin:8px 0}.confidence{font-size:.75rem}.reason{font-size:.65rem;margin-top:8px;background:rgba(0,0,0,0.2);display:inline-block;padding:4px 10px;border-radius:20px}.btn{background:rgba(255,255,255,0.15);border:none;padding:6px;border-radius:25px;color:#fff;cursor:pointer;width:100%;margin-top:6px;font-size:.7rem}.btn:hover{background:rgba(255,255,255,0.3)}.dot{width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;animation:pulse 1s infinite;margin-right:6px}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}</style></head>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui;background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);min-height:100vh;padding:20px;color:#fff}
+.container{max-width:1400px;margin:0 auto}
+h1{text-align:center;margin-bottom:10px;background:linear-gradient(135deg,#f093fb,#f5576c);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.timer{text-align:center;margin-bottom:20px;font-size:.8rem}
+.games-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:20px}
+.game-card{background:rgba(255,255,255,0.08);border-radius:20px;padding:18px;backdrop-filter:blur(10px)}
+.game-header{font-size:1.1rem;font-weight:bold;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.2);padding-bottom:8px}
+.pred-box{background:linear-gradient(135deg,#667eea,#764ba2);border-radius:15px;padding:12px;text-align:center;margin:12px 0}
+.pred-value{font-size:1.5rem;font-weight:800;margin:6px 0}
+.confidence{font-size:.7rem}
+.reason{font-size:.6rem;margin-top:6px;background:rgba(0,0,0,0.2);display:inline-block;padding:3px 8px;border-radius:20px}
+.info{font-size:.65rem;margin-top:8px;color:#aaa}
+.btn{background:rgba(255,255,255,0.15);border:none;padding:6px;border-radius:25px;color:#fff;cursor:pointer;width:100%;margin-top:6px;font-size:.65rem}
+.btn:hover{background:rgba(255,255,255,0.3)}
+.dot{width:8px;height:8px;border-radius:50%;background:#22c55e;display:inline-block;animation:pulse 1s infinite;margin-right:6px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.win{color:#4ade80}
+.lose{color:#f87171}
+</style></head>
 <body><div class="container"><h1>🎲 TÀI XỈU - ${Object.keys(GAMES).length} GAME 🎲</h1><div class="timer"><span class="dot"></span><span id="timerText">Đang tải...</span></div><div class="games-grid" id="gamesGrid">Đang tải...</div></div>
-<script>async function load(){try{const r=await fetch('/api/all');const d=await r.json();let h='';for(const[k,v]of Object.entries(d)){if(!v.success){h+='<div class="game-card"><div class="game-header">⚠️ '+k+'</div><div style="color:#f87171">Lỗi: '+v.error+'</div></div>';continue}let c=v.du_doan==='Tài'||v.du_doan==='🏦 CON'||v.du_doan==='Chẵn'?'#f87171':'#60a5fa';h+='<div class="game-card"><div class="game-header">'+v.icon+' '+v.game+'</div><div class="pred-box"><div class="pred-value" style="color:'+c+'">'+v.du_doan+'</div><div class="confidence">🎯 '+v.do_tin_cay+'</div><div class="reason">📐 '+v.ly_do+'</div></div><button class="btn" onclick="refresh(\''+k+'\')">🔄 Dự đoán lại</button><button class="btn" onclick="resetGame(\''+k+'\')">🗑️ Reset</button></div>';}document.getElementById('gamesGrid').innerHTML=h;document.getElementById('timerText').innerHTML=' Cập nhật: '+new Date().toLocaleString();}catch(e){}}async function refresh(g){await fetch('/api/predict/'+g);load();}async function resetGame(g){if(confirm('Xóa lịch sử ?')){await fetch('/api/reset/'+g,{method:'POST'});load();}}load();setInterval(load,30000);</script></body></html>`);
+<script>
+async function load(){try{const r=await fetch('/api/all');const d=await r.json();let h='';for(const[k,v]of Object.entries(d)){if(!v.success){h+='<div class="game-card"><div class="game-header">⚠️ '+k+'</div><div style="color:#f87171">Lỗi</div></div>';continue}
+let c='';let mainPred='';
+if(v.du_doan_con_cai){mainPred=v.du_doan_con_cai;c=mainPred==='Con'?'#f87171':'#60a5fa';
+h+='<div class="game-card"><div class="game-header">'+v.icon+' '+v.game+'</div><div class="pred-box"><div class="pred-value" style="color:'+c+'">🎯 '+mainPred+'</div><div class="confidence">Tin cậy: '+v.do_tin_cay_con_cai+'</div><div class="reason">'+v.ly_do_con_cai+'</div></div>';
+h+='<div class="info">🔄 Hòa: '+v.du_doan_hoa+' ('+v.do_tin_cay_hoa+')</div>';
+h+='<div class="info">🎲 Con Đôi: '+v.du_doan_con_doi+' | Cái Đôi: '+v.du_doan_cai_doi+'</div>';
+}else{mainPred=v.du_doan;c=mainPred==='Tài'||mainPred==='Chẵn'?'#f87171':'#60a5fa';
+h+='<div class="game-card"><div class="game-header">'+v.icon+' '+v.game+'</div><div class="pred-box"><div class="pred-value" style="color:'+c+'">🎯 '+mainPred+'</div><div class="confidence">Tin cậy: '+v.do_tin_cay+'</div><div class="reason">'+v.ly_do+'</div></div>';}
+if(v.ket_qua_truoc){let cls=v.dung_sai_truoc==='✅ ĐÚNG'?'win':'lose';h+='<div class="info">📜 Kết quả trước: '+v.ket_qua_truoc+' | '+v.dung_sai_truoc+'</div>';}
+h+='<div class="info">📌 Phiên: #'+v.phien_hien_tai+'</div>';
+h+='<button class="btn" onclick="refresh(\''+k+'\')">🔄 Dự đoán lại</button><button class="btn" onclick="resetGame(\''+k+'\')">🗑️ Reset</button></div>';}
+document.getElementById('gamesGrid').innerHTML=h;document.getElementById('timerText').innerHTML=' Cập nhật: '+new Date().toLocaleString();}catch(e){}}
+async function refresh(g){await fetch('/api/predict/'+g);load();}
+async function resetGame(g){if(confirm('Xóa lịch sử?')){await fetch('/api/reset/'+g,{method:'POST'});load();}}
+load();setInterval(load,30000);</script></body></html>`);
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 ${Object.keys(GAMES).length} GAME | MỖI GAME THUẬT TOÁN RIÊNG`);
-    console.log(`📡 BCR: Dự đoán Con/Cái/Hòa/Con Đôi/Cái Đôi`);
-    console.log(`📡 Tài Xỉu: 30+ loại cầu riêng`);
-    console.log(`📡 Xóc Đĩa: Chẵn/Lẻ riêng`);
+    console.log(`\n🚀 ${Object.keys(GAMES).length} GAME | Dự đoán luôn không cần đủ data`);
+    console.log(`📡 Mỗi game có lịch sử riêng + kết quả đúng/sai`);
 });
